@@ -21,6 +21,65 @@ st.write(
 
 st.success("The application is ready for learning!")
 
+# Optional teaching mode: use GLM results exported from a completed live run.
+from pathlib import Path
+import pandas as pd
+import plotly.express as px
+
+PRECOMPUTED_DIR = Path(__file__).resolve().parent / "precomputed_glm"
+st.divider()
+st.subheader("GLM teaching mode")
+glm_mode = st.radio(
+    "Choose how to explore the general linear model",
+    ["Quick demonstration (precomputed results)", "Full analysis (run the GLM)"],
+    index=0,
+    horizontal=True,
+    key="glm_teaching_mode",
+)
+precomputed_files = {
+    "GLM coefficients": PRECOMPUTED_DIR / "glm_results.csv",
+    "Left-hand tapping contrast": PRECOMPUTED_DIR / "left_contrast.csv",
+    "Right-hand tapping contrast": PRECOMPUTED_DIR / "right_contrast.csv",
+}
+if glm_mode.startswith("Quick"):
+    if all(path.is_file() for path in precomputed_files.values()):
+        try:
+            quick_glm = pd.read_csv(precomputed_files["GLM coefficients"])
+            quick_left = pd.read_csv(precomputed_files["Left-hand tapping contrast"])
+            quick_right = pd.read_csv(precomputed_files["Right-hand tapping contrast"])
+            required = {"Condition", "Chroma", "ch_name", "theta"}
+            if not required.issubset(quick_glm.columns):
+                raise ValueError("The saved GLM results are missing required columns.")
+            st.success("Precomputed GLM results loaded — no fitting required.")
+            st.caption("Results from a previously completed run of the same Participant-1 pipeline.")
+            quick_hbo = quick_glm.loc[
+                (quick_glm["Chroma"] == "hbo")
+                & quick_glm["Condition"].isin(["Tapping/Left", "Tapping/Right"])
+            ].copy()
+            if not quick_hbo.empty:
+                fig_quick = px.bar(
+                    quick_hbo, x="ch_name", y="theta", color="Condition",
+                    barmode="group", title="Precomputed HbO GLM: Left vs Right Tapping",
+                    labels={"ch_name": "fNIRS channel", "theta": "HbO coefficient (mol/L)"},
+                )
+                st.plotly_chart(fig_quick, width="stretch")
+            selected_quick = st.selectbox(
+                "Explore a precomputed contrast", ["Tapping/Left", "Tapping/Right"],
+                key="precomputed_contrast_choice",
+            )
+            selected_df = quick_left if selected_quick == "Tapping/Left" else quick_right
+            st.dataframe(selected_df, hide_index=True)
+            st.caption("These are channel-level GLM estimates; they do not by themselves establish "
+                       "statistically significant cortical activation.")
+        except Exception as exc:
+            st.error(f"Could not read the saved GLM results: {exc}")
+    else:
+        st.info("Precomputed results have not been added to this repository yet. "
+                "Select Full analysis, run the GLM once, then download and upload "
+                "the three CSV files to the precomputed_glm folder on GitHub.")
+else:
+    st.info("Full analysis is enabled below. The GLM can take several minutes.")
+
 
 # Lesson 2: Load the example fNIRS dataset
 
@@ -755,6 +814,14 @@ if (
     if "glm_est" in st.session_state:
 
         st.write("GLM results are available for the next stage.")
+        st.caption("To enable the quick demonstration for everyone, export these real "
+                   "results and upload them to GitHub under precomputed_glm/.")
+        st.download_button(
+            "Download glm_results.csv",
+            st.session_state["glm_est"].to_dataframe().to_csv(index=False).encode("utf-8"),
+            file_name="glm_results.csv", mime="text/csv",
+            key="export_glm_results",
+        )
 
 # Stage 10.3: View GLM Results
 
@@ -901,6 +968,16 @@ if "glm_est" in st.session_state:
     st.session_state["right_contrast_df"] = right_contrast_df
 
     st.success("Left and right tapping contrasts prepared!")
+    st.download_button(
+        "Download left_contrast.csv",
+        left_contrast_df.to_csv(index=False).encode("utf-8"),
+        file_name="left_contrast.csv", mime="text/csv", key="export_left_contrast",
+    )
+    st.download_button(
+        "Download right_contrast.csv",
+        right_contrast_df.to_csv(index=False).encode("utf-8"),
+        file_name="right_contrast.csv", mime="text/csv", key="export_right_contrast",
+    )
 
 
 # Stage 11.5: Interactive HbO brain maps
