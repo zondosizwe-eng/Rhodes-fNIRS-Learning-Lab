@@ -1019,37 +1019,59 @@ def get_initial_head_mri_transform(info, fiducial_file):
 
 
 def make_hbo_map(info, contrast_df, subjects_dir, trans, hemi="lh", spread_mm=15):
-    """Interpolate HbO channel effects around transformed channel midpoints."""
+    """Illustrative interpolation of HbO effects around template-projected channels."""
     from scipy.spatial import cKDTree
-    from scipy.spatial.distance import cdist
 
     surf_file = subjects_dir / "fsaverage" / "surf" / f"{hemi}.pial"
     vertices, faces = load_surface(surf_file)
-    picks = mne.pick_types(info, fnirs="hbo")
-    channel_names = [info["ch_names"][i] for i in picks]
-    positions = np.array([info["chs"][i]["loc"][:3] for i in picks])
-    # Map contrast values by channel name, not by arbitrary dataframe order.
-    hbo = contrast_df[contrast_df["Chroma"] == "hbo"].set_index("ch_name")
-    missing = [name for name in channel_names if name not in hbo.index]
-    if missing:
-        raise ValueError(f"Missing HbO GLM estimates for channels: {missing[:4]}")
-    effects = np.array([float(hbo.loc[name, "effect"]) for name in channel_names]) * 1e6
-    positions_mm = apply_trans(trans, positions) * 1000
-    if not np.isfinite(positions_mm).all() or not np.isfinite(effects).all():
-        raise ValueError("Non-finite channel positions or GLM estimates")
+    hbo = contrast_df.loc[contrast_df["Chroma"].str.lower() == "hbo"].set_index("ch_name")
 
-    # Project positions onto nearest surface vertex. This is only an approximation.
+    # Raw NIRx contains wavelength channels; processed data contain HbO channels.
+    # Both retain channel midpoint coordinates in info['chs'][...]['loc'][:3].
+    channels = {}
+    for ch in info["chs"]:
+        name = ch["ch_name"]
+        if name.endswith(" hbo"):
+            key = name
+        elif name.rsplit(" ", 1)[-1].isdigit():
+            key = name.rsplit(" ", 1)[0] + " hbo"
+        else:
+            continue
+        if key in hbo.index and key not in channels:
+            channels[key] = np.asarray(ch["loc"][:3], dtype=float)
+    if not channels:
+        raise ValueError("No matching HbO channel positions were found in the recording.")
+    names = list(channels)
+    positions = np.array([channels[name] for name in names])
+    effects = np.array([float(hbo.loc[name, "effect"]) for name in names]) * 1e6
+    if not np.isfinite(positions).all() or not np.isfinite(effects).all():
+        raise ValueError("Invalid channel coordinates or contrast effects")
+    positions_mm = apply_trans(trans, positions) * 1000
     tree = cKDTree(vertices)
     _, nearest = tree.query(positions_mm)
     projected = vertices[nearest]
-    # Limit Gaussian weighting to channels within ~3 standard deviations.
-    distances = cdist(vertices, projected)
+
+    # Restrict each hemisphere to channels projected to that hemisphere.
+    same_side = positions_mm[:, 0] < 0 if hemi == "lh" else positions_mm[:, 0] >= 0
+    if not same_side.any():
+        return vertices, faces, np.zeros(len(vertices)), np.zeros(len(vertices), bool), projected, effects, names
+    projected_hemi = projected[same_side]
+    effects_hemi = effects[same_side]
+    # Sparse local interpolation; do not imply measurements throughout the cortex.
+    tree_ch = cKDTree(projected_hemi)
+    distances, nearest_ch = tree_ch.query(vertices, k=min(4, len(projected_hemi)))
+    distances = np.atleast_2d(distances) if distances.ndim == 1 else distances
+    nearest_ch = np.atleast_2d(nearest_ch) if nearest_ch.ndim == 1 else nearest_ch
+    if distances.shape[0] != len(vertices):
+        distances = distances.T
+        nearest_ch = nearest_ch.T
     weights = np.exp(-0.5 * (distances / spread_mm) ** 2)
     weights[distances > 3 * spread_mm] = 0
-    denom = weights.sum(axis=1)
-    values = np.divide(weights @ effects, denom, out=np.zeros(len(vertices)), where=denom > 1e-5)
-    coverage = denom > 0.03
-    return vertices, faces, values, coverage, projected, effects, channel_names
+    denominator = weights.sum(axis=1)
+    values = np.divide((weights * effects_hemi[nearest_ch]).sum(axis=1), denominator,
+                       out=np.zeros(len(vertices)), where=denominator > 1e-8)
+    coverage = denominator > 0.03
+    return vertices, faces, values, coverage, projected, effects, names
 
 
 st.divider()
@@ -1058,15 +1080,42 @@ st.caption("Finger-tapping GLM effect estimates (µM), projected onto the fsaver
            "Exploratory visualisation only: not a statistical significance or individual anatomy map.")
 
 subjects_dir = Path.home() / "mne_data" / "MNE-fsaverage-data"
+# MNE's standard fsaverage location can vary by machine.
+if not (subjects_dir / "fsaverage" / "surf" / "lh.pial").exists():
+    alternative = Path.home() / "mne_data" / "fsaverage"
+    if (alternative / "surf" / "lh.pial").exists():
+        subjects_dir = alternative.parent
 fiducial_file = subjects_dir / "fsaverage" / "bem" / "fsaverage-fiducials.fif"
-ready = all(k in st.session_state for k in
-            ("raw_haemo", "left_contrast_df", "right_contrast_df"))
 
-if not ready:
-    st.info("To display brain maps: load data → convert to optical density → apply TDDR → "
-            "convert to HbO/HbR → run the GLM. The maps will then appear here.")
-elif not fiducial_file.exists():
-    st.error(f"fsaverage fiducials were not found: {fiducial_file}")
+# The quick demonstration uses saved contrasts and raw NIRx optode coordinates.
+quick_ready = (glm_mode.startswith("Quick")
+               and "quick_left" in locals() and "quick_right" in locals())
+if quick_ready:
+    st.session_state["left_contrast_df"] = quick_left
+    st.session_state["right_contrast_df"] = quick_right
+
+has_contrasts = all(k in st.session_state for k in ("left_contrast_df", "right_contrast_df"))
+has_info = (st.session_state.get("raw_haemo") is not None
+            or st.session_state.get("raw") is not None)
+ready = has_contrasts and has_info
+
+if not has_contrasts:
+    st.info("GLM contrasts are not available. Choose Quick demonstration and check that "
+            "the three CSV files are in precomputed_glm/.")
+elif not has_info:
+    st.info("Click **Load finger-tapping data** above to obtain channel positions. "
+            "The quick demonstration does not require optical-density conversion or GLM fitting.")
+elif not fiducial_file.exists() or not (subjects_dir / "fsaverage" / "surf" / "lh.pial").exists():
+    st.warning("The fsaverage template is not installed in this environment. "
+               "It supplies the cortical surface and anatomical fiducials for the maps.")
+    if st.button("Install fsaverage template for 3D maps"):
+        with st.spinner("Downloading the standard fsaverage anatomy (first use may take time)..."):
+            try:
+                subjects_dir = Path(mne.datasets.fetch_fsaverage(verbose=False)) .parent
+                st.success("fsaverage template installed. The maps can now be displayed.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Could not download fsaverage: {exc}")
 else:
     st.success("HbO data and left/right GLM contrasts are ready.")
     condition = st.radio("Finger-tapping condition", ["Tapping/Left", "Tapping/Right"],
@@ -1076,7 +1125,7 @@ else:
     spread_mm = st.slider("Illustrative spatial smoothing (mm)", 8, 25, 15, 1)
     contrast = st.session_state["left_contrast_df" if condition == "Tapping/Left"
                                 else "right_contrast_df"]
-    info = st.session_state["raw_haemo"].info
+    info = (st.session_state.get("raw_haemo") or st.session_state["raw"]).info
     hemi = "lh" if hemisphere == "Left" else "rh"
     try:
         trans, errors = get_initial_head_mri_transform(info, fiducial_file)
@@ -1091,10 +1140,8 @@ else:
             i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
             color="lightgray", opacity=0.25, name="Template cortex", hoverinfo="skip"))
         # Face intensity is derived from vertex intensities; masked outside coverage.
-        face_values = values[faces].mean(axis=1)
         face_covered = coverage[faces].any(axis=1)
         coloured_faces = faces[face_covered]
-        coloured_intensity = face_values[face_covered]
         if len(coloured_faces):
             fig.add_trace(go.Mesh3d(
                 x=vertices[:, 0], y=vertices[:, 1], z=vertices[:, 2],
@@ -1105,7 +1152,7 @@ else:
                 name="HbO GLM effect", hoverinfo="skip",
                 lighting=dict(ambient=0.55, diffuse=0.7)))
         # Show projected channel midpoints to communicate sparse spatial sampling.
-        side = projected[:, 0] < 0 if hemi == "lh" else projected[:, 0] >= 0
+        side = np.ones(len(names), dtype=bool)  # Show all measured channels as context
         fig.add_trace(go.Scatter3d(
             x=projected[side, 0], y=projected[side, 1], z=projected[side, 2],
             mode="markers", marker=dict(size=3, color="black"),
@@ -1116,7 +1163,7 @@ else:
             scene=dict(xaxis_visible=False, yaxis_visible=False, zaxis_visible=False,
                        aspectmode="data"),
             margin=dict(l=0, r=0, t=55, b=0), height=630)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
         st.caption("Rotate: drag | Zoom: scroll | Pan: right-drag. "
                    "Grey = outside approximate channel coverage. "
                    "Colour scale fixed at −1.3 to +1.3 µM for condition comparisons.")
